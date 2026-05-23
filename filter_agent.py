@@ -706,11 +706,29 @@ def check_screenpipe():
 # Main loop
 # ---------------------------------------------------------------------------
 
+def _load_plugins():
+    try:
+        from plugins import load_plugins
+        instances = load_plugins()
+        log.info(f"loaded {len(instances)} plugin(s): {[p.name for p in instances]}")
+        for p in instances:
+            try:
+                p.on_start()
+            except Exception as e:
+                log.warning(f"plugin {p.name} on_start error: {e}")
+        return instances
+    except Exception as e:
+        log.warning(f"plugin load failed: {e} — running without plugins")
+        return []
+
+
 def run():
     global _cycle_count
     check_env()
     log.info(f"AOL Filter Agent | poll: {POLL_INTERVAL_MIN}m | model: {ANTHROPIC_MODEL}")
     check_screenpipe()
+
+    plugins = _load_plugins()
 
     while not _stop.is_set():
         try:
@@ -721,6 +739,12 @@ def run():
             if context.strip() not in ("(empty)", "(no usable data)"):
                 result = run_claude(context, source)
                 write_mempalace(result)
+
+                for p in plugins:
+                    try:
+                        p.process(result, context, source)
+                    except Exception as e:
+                        log.warning(f"plugin {p.name} process error: {e}")
             else:
                 log.info("no content this cycle — skipping LLM pass")
 
@@ -743,6 +767,12 @@ def run():
             log.error(f"unhandled error in cycle: {e} — continuing")
 
         _stop.wait(timeout=POLL_INTERVAL_MIN * 60)
+
+    for p in plugins:
+        try:
+            p.on_stop()
+        except Exception as e:
+            log.warning(f"plugin {p.name} on_stop error: {e}")
 
     log.info("filter agent stopped cleanly")
 
