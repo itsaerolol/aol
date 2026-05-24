@@ -16,7 +16,7 @@ import filter_controller
 import screenpipe
 import ws
 import memory_api
-import html as html_
+import dashboard
 from config import C2_PORT, IDLE_THRESHOLD_MINUTES
 from logs import filter_log_buffer, log, log_buffer, sp_log_buffer
 
@@ -49,7 +49,7 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 app.include_router(ws.router)
 app.include_router(memory_api.router)
-app.include_router(html_.router)
+app.include_router(dashboard.router)
 
 
 # ---------------------------------------------------------------------------

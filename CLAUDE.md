@@ -42,7 +42,7 @@ aol_c2.py              # Entry point — 12 lines, just runs uvicorn
 server.py              # FastAPI app + lifespan + control/log routes — mounts 3 routers
 ├── ws.py              # WSManager, build_status(), push_loop(), /ws WebSocket endpoint
 ├── memory_api.py      # APIRouter at /memory — /search, /recent, /kg
-└── html.py            # Dashboard HTML string + / route
+└── dashboard.py       # Dashboard HTML string + / route
 config.py              # All constants: ports, thresholds, paths, model names
 logs.py                # Three circular log buffers (200-item cap) + log functions
 activity.py            # pynput mouse/keyboard listeners, idle_seconds(), in_blackout()
@@ -63,7 +63,7 @@ legacy versions/       # Historical v1 and v3 — kept for reference, not active
 - `aol_c2.py` — runs `uvicorn` on port `45139`, nothing else
 - `server.py` — lifespan starts activity listeners + control loop thread + WebSocket push task; mounts ws/memory_api/html routers; owns control endpoints (`/start`, `/stop`, `/resume`, `/filter/start`, `/filter/stop`, `/status`) and raw log endpoints (`/logs`, `/screenpipe-logs`, `/filter-logs`)
 - `ws.py` — WebSocket at `/ws`; pushes `{status, c2_logs, sp_logs, fa_logs}` to all clients every 1 second; dashboard polls this instead of HTTP
-- `html.py` — self-contained dashboard: status cards, action buttons, 3 live log panels, memory search panel, KG triple viewer
+- `dashboard.py` — self-contained dashboard: status cards, action buttons, 3 live log panels, memory search panel, KG triple viewer
 - `memory_api.py` — `/memory/search` (semantic ChromaDB), `/memory/recent`, `/memory/kg` (KG triple lookup by entity)
 
 ### Control Layer
