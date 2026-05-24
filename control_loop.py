@@ -29,10 +29,9 @@ def run():
 
     if not activity.in_blackout():
         screenpipe.start()
+        filter_controller.start()
     else:
-        log("in blackout window, screenpipe not started")
-
-    filter_controller.start()
+        log("in blackout window, screenpipe + filter agent not started")
 
     last_check = activity.last_activity_time()
 
@@ -42,6 +41,8 @@ def run():
         if _override_pause:
             if screenpipe.running():
                 screenpipe.stop("manual override")
+            if filter_controller.running():
+                filter_controller.stop("manual override")
             continue
 
         idle     = activity.idle_seconds()
@@ -58,16 +59,17 @@ def run():
         if blackout:
             if screenpipe.running():
                 screenpipe.stop("blackout window")
+            if filter_controller.running():
+                filter_controller.stop("blackout window")
             continue
 
         if idle > IDLE_THRESHOLD_MINUTES * 60:
             if screenpipe.running():
                 screenpipe.stop(f"idle {idle/60:.1f}m")
+            if filter_controller.running():
+                filter_controller.stop(f"idle {idle/60:.1f}m")
         else:
             if not screenpipe.running():
-                log("activity detected — resuming screenpipe")
+                log("activity detected — resuming screenpipe + filter agent")
                 screenpipe.start()
-
-        if not filter_controller.running():
-            log("filter agent not running — restarting")
-            filter_controller.start()
+                filter_controller.start()

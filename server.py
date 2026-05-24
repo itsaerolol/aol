@@ -65,6 +65,7 @@ def status():
 def api_start():
     control_loop.set_override(False)
     screenpipe.start()
+    filter_controller.start()
     return {"ok": True}
 
 
@@ -72,6 +73,7 @@ def api_start():
 def api_stop():
     control_loop.set_override(True)
     screenpipe.stop("manual stop")
+    filter_controller.stop("manual stop")
     return {"ok": True}
 
 
