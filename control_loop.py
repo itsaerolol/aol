@@ -16,6 +16,10 @@ _override_pause    = False
 _lock              = threading.Lock()
 _fa_last_run_date: datetime.date | None = None
 
+# Don't attempt to restart screenpipe within this many seconds of the last
+# start() call — gives it time to initialise and avoids hammering a crashing process.
+SP_GRACE_SECONDS = 90
+
 
 def _fa_due() -> bool:
     """True if it is at or past 21:30 and FA has not already run today."""
@@ -103,8 +107,12 @@ def run():
                 screenpipe.stop(f"idle {idle/60:.1f}m")
         else:
             if not screenpipe.running():
-                log("activity detected — resuming screenpipe")
-                screenpipe.start()
+                age = screenpipe.start_age()
+                if age is not None and age < SP_GRACE_SECONDS:
+                    log(f"screenpipe not yet up — grace period ({SP_GRACE_SECONDS - int(age)}s left)")
+                else:
+                    log("activity detected — resuming screenpipe")
+                    screenpipe.start()
 
         # Daily FA trigger — fires at 21:30 regardless of idle state
         if _fa_due():

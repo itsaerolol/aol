@@ -69,7 +69,7 @@ def status():
 def api_start():
     control_loop.set_override(False)
     screenpipe.start()
-    filter_controller.start()
+    # FA is one-shot daily — don't start it here. Use /filter/start for manual FA.
     return {"ok": True}
 
 
