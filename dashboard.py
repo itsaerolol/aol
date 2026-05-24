@@ -48,6 +48,8 @@ HTML = """<!DOCTYPE html>
   button.r:hover { background: #1c0a0a; }
   button.b { border-color: #1e3a5f; color: #60a5fa; }
   button.b:hover { background: #0a1828; }
+  button.y { border-color: #713f12; color: #facc15; }
+  button.y:hover { background: #1c1200; }
 
   /* log panels */
   .logs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
@@ -126,6 +128,9 @@ HTML = """<!DOCTYPE html>
   <div class="sep"></div>
   <button class="b" onclick="api('/filter/start','POST')">&#9654; FA Start</button>
   <button class="r" onclick="api('/filter/stop','POST')">&#9632; FA Stop</button>
+  <div class="sep"></div>
+  <button class="y" onclick="confirmApi('/restart','POST','Restart C2?')">&#8635; Restart</button>
+  <button class="r" onclick="confirmApi('/shutdown','POST','Shutdown C2?')">&#9211; Shutdown</button>
 </div>
 
 <div class="logs">
@@ -202,6 +207,11 @@ function renderLog(boxId, entries, cls) {
 }
 
 async function api(ep, method='GET') { await fetch(ep, { method }); }
+
+async function confirmApi(ep, method, msg) {
+  if (!confirm(msg)) return;
+  await fetch(ep, { method }).catch(() => {});
+}
 
 async function searchMem() {
   const q = document.getElementById('mem-q').value.trim();

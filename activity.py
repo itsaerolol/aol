@@ -32,7 +32,7 @@ def in_blackout() -> bool:
 def start(log_fn=None):
     global _mouse_listener, _kb_listener
     _mouse_listener = mouse.Listener(
-        on_move=_on_activity, on_click=_on_activity, on_scroll=_on_activity, daemon=True
+        on_click=_on_activity, daemon=True
     )
     _kb_listener = keyboard.Listener(on_press=_on_activity, daemon=True)
     _mouse_listener.start()

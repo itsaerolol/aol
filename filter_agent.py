@@ -1,8 +1,9 @@
 """
 AOL Filter Agent
-Polls Screenpipe every POLL_INTERVAL_MIN, runs a Claude LLM pass to extract
-operationally significant memories AND rich knowledge graph facts, writes
-HIGH/MEDIUM entries to MemPalace.
+Runs once per day at 21:30, launched by control_loop.py. Fetches the past 24 hours of
+Screenpipe data, runs a Claude LLM pass to extract operationally significant memories
+AND rich knowledge graph facts, writes HIGH/MEDIUM entries to MemPalace. Exits cleanly
+after one cycle — no internal loop or sleep.
 
 Primary source : /activity-summary (~200-500 tokens, pre-compressed)
 Fallback        : raw /search OCR + audio
@@ -17,10 +18,8 @@ import hashlib
 import json
 import logging
 import os
-import signal
 import sys
-import threading
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import io
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
@@ -42,13 +41,12 @@ ANTHROPIC_ENDPOINT  = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_MODEL     = "claude-opus-4-7"
 ANTHROPIC_VERSION   = "2023-06-01"
 
-POLL_INTERVAL_MIN   = 720
-LOOKBACK_BUFFER_MIN = 5
+POLL_INTERVAL_MIN   = 1440  # 24 h — used for lookback calc; scheduling is handled externally
+LOOKBACK_BUFFER_MIN = 60    # ~25-hour window to handle slight timing drift
 SEARCH_LIMIT        = 150
 
-# Every N cycles, run a synthesis pass that promotes repeated patterns → permanent KG facts
-SYNTHESIS_EVERY_N   = 5
-_cycle_count        = 0
+# Synthesis pass runs every N days (tracked durably in filter_metadata.json)
+SYNTHESIS_INTERVAL_DAYS = 5
 
 MEMPALACE_PATH      = "~/aol-memory"
 MEMPALACE_WING      = "aero-ops"
@@ -69,19 +67,38 @@ logging.basicConfig(
 log = logging.getLogger("filter")
 
 # ---------------------------------------------------------------------------
-# Shutdown
+# Metadata helpers — durable state across invocations
 # ---------------------------------------------------------------------------
 
-_stop = threading.Event()
+def _meta_path() -> str:
+    return os.path.join(os.path.expanduser(MEMPALACE_PATH), "filter_metadata.json")
 
 
-def _handle_shutdown(signum=None, frame=None):
-    log.info(f"shutdown signal received ({signum}) — stopping after current cycle")
-    _stop.set()
+def _load_metadata() -> dict:
+    try:
+        with open(_meta_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-signal.signal(signal.SIGINT,  _handle_shutdown)
-signal.signal(signal.SIGTERM, _handle_shutdown)
+def _save_metadata(data: dict):
+    path = _meta_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _synthesis_due() -> bool:
+    meta = _load_metadata()
+    last = meta.get("last_synthesis_date")
+    if not last:
+        return True
+    try:
+        delta = (date.today() - date.fromisoformat(last)).days
+        return delta >= SYNTHESIS_INTERVAL_DAYS
+    except Exception:
+        return True
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -199,7 +216,9 @@ def fetch_context(minutes_back: int) -> tuple[str, str]:
 
 SYSTEM_PROMPT = """You are AOL Filter, the memory intelligence layer for Aero — a systems-oriented developer, AFROTC cadet, and operator running a personal AI operating system (AOL).
 
-Your job runs every 60 minutes. You receive raw screen + audio capture data from Screenpipe and return two things: structured memory entries for ChromaDB, and knowledge graph triples for MemPalace. You are the only thing standing between raw noise and a queryable, durable model of Aero's life and work.
+Your job runs once per day at 21:30. The capture window covers the past 24 hours of the operator's activity. You receive raw screen + audio capture data from Screenpipe and return two things: structured memory entries for ChromaDB, and knowledge graph triples for MemPalace. You are the only thing standing between raw noise and a queryable, durable model of Aero's life and work.
+
+Identify what mattered most today — decisions made, things learned, work completed, patterns noticed. Prefer entries that will still be meaningful a week from now over entries that only describe what was on screen at a given moment.
 
 ---
 
@@ -207,26 +226,19 @@ Your job runs every 60 minutes. You receive raw screen + audio capture data from
 
 Name: Aero
 KG entity key: "aero"
-Domains: Developer, AFROTC, Faith, Creative, Finance
 
-Active projects:
-- AOL — his personal AI operating system (this system you're part of)
-- Evergreen — iOS app
-- USAF Fitness Tracker — fitness tracking tool
-- Whiteframe — creative/design project
-- ACE ISLAND — game or simulation project
-
-Faith frameworks: The Consecration, Christianized Shinobi Framework
-Tools observed: Antigravity IDE, claude.exe, screenpipe, Vercel, Supabase
+Current context about Aero — his active projects, tools, and state — is provided in the EXISTING MEMORY and EXISTING KG FACTS sections at the top of each request. Use that grounding to stay consistent with established facts and to understand what's worth capturing.
 
 ---
 
 ## INPUT FORMAT
 
 You will receive:
+- EXISTING MEMORY: recent memories already stored — use to pattern-match signal quality and avoid duplication
+- EXISTING KG FACTS: current stable facts about Aero — do not re-assert these
 - Current timestamp
 - Data source: "activity-summary" or "raw-search"
-- Raw context: app usage durations, OCR screen text, audio transcriptions, UI events
+- NEW CAPTURE DATA: app usage durations, OCR screen text, audio transcriptions, UI events
 
 ---
 
@@ -249,27 +261,34 @@ KEEP:
 - HIGH: confirmed active work session (10+ min on tracked app), decisions made, deadlines set, commitments, milestones, blockers identified
 - MEDIUM: research with clear intent, task planning, meaningful comms, learning tied to a domain
 
-DISCARD ENTIRELY:
-- Gaming, entertainment, passive video/streaming
-- Aimless browsing, news, social media without clear intent
-- Idle time, lock screens, screensavers
-- Redundant content already captured this session
+DISCARD ENTIRELY — signal-quality rules (not category rules):
+- Hedged or vague: could not confidently state what was actually happening
+- Under 10 minutes on a single app with no clear output, decision, or learning
+- No artifact, decision, milestone, or learning produced — pure passive consumption
+- Already captured: if EXISTING MEMORY already covers this event, skip it
+
+Tag what you observe faithfully. If activity doesn't fit a known pattern, describe it and tag it.
+Novel things get tagged "new-pattern" plus the most descriptive label available.
+Tags are lowercase, hyphenated. Examples: aol-system, faith-devotional, afrotc-deadline,
+gaming-session, fitness-workout, consecration, developer-work, new-pattern
 
 Memory schema:
 {
   "priority": "HIGH" | "MEDIUM",
-  "domain": "Developer" | "AFROTC" | "Faith" | "Creative" | "Finance",
-  "project": "<project name or null>",
   "summary": "<1-2 sentences: what happened, what was decided, what matters>",
-  "tags": ["<tag1>", "<tag2>"],
+  "tags": ["<lowercase-hyphenated-tag>", "<tag2>"],
   "timestamp": "<ISO 8601>"
 }
+
+If nothing is worth keeping: {"memories": [], "kg_facts": []}
 
 ---
 
 ## PART 2 — KNOWLEDGE GRAPH FACTS
 
 This is the most important part of your job. Extract every structural fact the session data supports. Be aggressive. 10-50 facts per session is normal. The goal is a KG that a future session can query to instantly know: what tools Aero uses, what projects are active, what's his stack, who he works with, what's his workflow, what's blocked.
+
+IMPORTANT: EXISTING KG FACTS at the top of this request shows what is already known. Do NOT re-assert facts already present in that list. Only write facts that are new, updated, or not yet captured.
 
 Use snake_case predicates. Be specific: "primary_ide" not "uses". "runs_on_port" not "runs_on".
 
@@ -386,13 +405,131 @@ You are also capable of pattern recognition across facts. If the session data cl
 3. Never invent data not supported by the session input.
 4. Prefer specific predicates over generic ones.
 5. One kg_fact per subject-predicate-object combination — don't duplicate.
-6. Evidence field is required on every kg_fact. One sentence, grounded in the input.
-7. Write every fact the evidence supports. Omission is a failure mode."""
+6. Do not re-assert KG facts already listed in EXISTING KG FACTS.
+7. Evidence field is required on every kg_fact. One sentence, grounded in the input.
+8. Write every fact the evidence supports. Omission is a failure mode."""
 
 
 def run_claude(context: str, source: str) -> dict:
-    now_str  = datetime.now().strftime("%Y-%m-%d %H:%M")
-    user_msg = f"Current time: {now_str}\nData source: {source}\n\n{context}"
+    now_str     = datetime.now().strftime("%Y-%m-%d %H:%M")
+    palace_path = os.path.expanduser(MEMPALACE_PATH)
+
+    # Predicates that are per-session snapshots — excluded from stable KG grounding
+    _KG_SESSION_NOISE = {
+        "session_time_in", "used_tool_this_session", "context_switches_between",
+        "focuses_on", "worked_on", "typical_work_start", "hardware_brand",
+        "communication_platform", "shell", "system_monitoring_tool",
+        "primary_ai_assistant", "primary_ai_tool", "workflow_pattern",
+    }
+
+    # --- Grounding block 1: L0 identity one-liner ---
+    L0_line = "(no identity context)"
+    try:
+        from mempalace.layers import MemoryStack
+        stack   = MemoryStack(palace_path=palace_path)
+        wake_raw = stack.wake_up(wing=MEMPALACE_WING)
+        L0_line  = wake_raw.split("\n")[0].strip()
+        log.info(f"wake_up L0: {len(L0_line)} chars")
+    except Exception as e:
+        log.warning(f"wake_up failed: {e} — using empty L0")
+
+    # --- Grounding block 2: full ChromaDB room content (untruncated) ---
+    _GROUNDING_ROOMS = [
+        "identity", "projects-active", "aol-system",
+        "tech-environment", "working-style", "workspace-map",
+    ]
+    room_docs   = {}
+    all_drawers = []
+    try:
+        import chromadb
+        from mempalace.config import MempalaceConfig
+        chroma  = chromadb.PersistentClient(path=palace_path)
+        col     = chroma.get_or_create_collection(
+            name=MempalaceConfig().collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        res = col.get(limit=500, include=["documents", "metadatas"])
+        for doc, meta in zip(res.get("documents", []), res.get("metadatas", [])):
+            room = meta.get("room", "")
+            if room in _GROUNDING_ROOMS and room not in room_docs:
+                room_docs[room] = doc
+            # Drawer entries have timestamp + priority (room docs don't)
+            if meta.get("timestamp") and meta.get("priority"):
+                all_drawers.append({"doc": doc, "meta": meta})
+    except Exception as e:
+        log.warning(f"ChromaDB grounding fetch failed: {e}")
+
+    full_rooms = [f"[{r}]\n{room_docs[r]}" for r in _GROUNDING_ROOMS if r in room_docs]
+    full_room_block = "\n\n".join(full_rooms) if full_rooms else "(no room content)"
+    log.info(f"grounding rooms: {len(full_rooms)} loaded ({len(full_room_block)} chars)")
+
+    memory_context = f"{L0_line}\n\n{full_room_block}" if L0_line else full_room_block
+
+    # --- Grounding block 3: recent extraction examples (pattern/tag reference) ---
+    all_drawers.sort(key=lambda x: x["meta"].get("timestamp", ""), reverse=True)
+    recent_lines = []
+    for entry in all_drawers[:5]:
+        doc      = entry["doc"]
+        meta     = entry["meta"]
+        ts       = meta.get("timestamp", "?")
+        pri      = meta.get("priority", "?")
+        tags_raw = meta.get("tags", "[]")
+        try:
+            tags = json.loads(tags_raw) if isinstance(tags_raw, str) else tags_raw
+        except Exception:
+            tags = []
+        tag_str = ", ".join(tags) if tags else "(none)"
+        recent_lines.append(f"[{ts}] [{pri}] tags=[{tag_str}]\n  {doc[:200]}")
+
+    _BOOTSTRAP = (
+        "[BOOTSTRAP — vault empty. Target memory schema:]\n"
+        'Example HIGH:   {"priority":"HIGH","summary":"First working AOL cycle completed. Layer 2 now live.","tags":["aol-system","developer","milestone"],"timestamp":"2026-05-22T21:30:00"}\n'
+        'Example MEDIUM: {"priority":"MEDIUM","summary":"~45m debugging /activity-summary endpoint. OCR fallback confirmed.","tags":["aol-system","developer","debugging"],"timestamp":"2026-05-22T15:00:00"}\n'
+        "Tag conventions: lowercase, hyphenated — aol-system, developer, afrotc-deadline, "
+        "faith-devotional, fitness-workout, housing-research, creative-work, new-pattern"
+    )
+    recent_block = "\n\n".join(recent_lines) if recent_lines else _BOOTSTRAP
+
+    # --- Grounding block 4: stable KG facts (session noise filtered, deduped) ---
+    kg_context = "(none yet)"
+    try:
+        import sqlite3 as _sqlite3
+        kg_path  = os.path.join(palace_path, "knowledge_graph.sqlite3")
+        con      = _sqlite3.connect(kg_path)
+        cur      = con.cursor()
+        tri_cols = [r[1] for r in cur.execute("PRAGMA table_info(triples)").fetchall()]
+        rows     = cur.execute(
+            "SELECT * FROM triples ORDER BY subject, predicate, object"
+        ).fetchall()
+        seen     = set()
+        kg_lines = []
+        for row in rows:
+            d    = dict(zip(tri_cols, row))
+            pred = d.get("predicate", "")
+            obj  = d.get("object", "")
+            vto  = d.get("valid_to", "")
+            if pred in _KG_SESSION_NOISE:
+                continue
+            is_perm = not vto
+            key = (pred, obj)
+            if is_perm and key in seen:
+                continue
+            if is_perm:
+                seen.add(key)
+            expiry = f" (until {vto})" if vto else ""
+            kg_lines.append(f"  {pred} → {obj}{expiry}")
+        con.close()
+        kg_context = "\n".join(kg_lines) if kg_lines else "(none yet)"
+        log.info(f"KG grounding: {len(kg_lines)} stable facts loaded")
+    except Exception as e:
+        log.warning(f"KG grounding failed: {e} — proceeding without KG context")
+
+    user_msg = (
+        f"EXISTING MEMORY (what you already know about this operator):\n{memory_context}\n\n"
+        f"EXISTING KG FACTS (stable — do not duplicate):\n{kg_context}\n\n"
+        f"RECENT EXTRACTIONS (for pattern/tag reference):\n{recent_block}\n\n"
+        f"---\nCurrent time: {now_str}\nData source: {source}\n\nNEW CAPTURE DATA:\n{context}"
+    )
 
     payload = {
         "model":      ANTHROPIC_MODEL,
@@ -494,8 +631,6 @@ def write_mempalace(result: dict):
                     "wing":      MEMPALACE_WING,
                     "room":      MEMPALACE_ROOM,
                     "priority":  mem["priority"],
-                    "domain":    mem["domain"],
-                    "project":   mem.get("project") or "",
                     "tags":      json.dumps(mem.get("tags", [])),
                     "timestamp": mem.get("timestamp", datetime.now().isoformat()),
                 }],
@@ -572,7 +707,7 @@ def _write_fallback(result: dict):
     )
 
 # ---------------------------------------------------------------------------
-# Synthesis pass — every N cycles, promote repeated patterns → permanent facts
+# Synthesis pass — every SYNTHESIS_INTERVAL_DAYS, promote repeated patterns → permanent facts
 # ---------------------------------------------------------------------------
 
 SYNTHESIS_PROMPT = """You are AOL Synthesizer. You receive a dump of recent knowledge graph triples about Aero (an operator/developer).
@@ -711,7 +846,7 @@ def check_screenpipe():
         log.warning(f"screenpipe health check failed: {e} — will retry on next cycle")
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Plugin loader
 # ---------------------------------------------------------------------------
 
 def _load_plugins():
@@ -729,60 +864,64 @@ def _load_plugins():
         log.warning(f"plugin load failed: {e} — running without plugins")
         return []
 
+# ---------------------------------------------------------------------------
+# Main — single cycle, then exit
+# ---------------------------------------------------------------------------
 
 def run():
-    global _cycle_count
     check_env()
-    log.info(f"AOL Filter Agent | poll: {POLL_INTERVAL_MIN}m | model: {ANTHROPIC_MODEL}")
+    log.info(f"AOL Filter Agent | daily | model: {ANTHROPIC_MODEL}")
     check_screenpipe()
 
     plugins = _load_plugins()
 
-    while not _stop.is_set():
-        try:
-            log.info("--- cycle start ---")
-            lookback        = POLL_INTERVAL_MIN + LOOKBACK_BUFFER_MIN
-            context, source = fetch_context(lookback)
+    try:
+        log.info("--- daily cycle start ---")
+        lookback        = POLL_INTERVAL_MIN + LOOKBACK_BUFFER_MIN
+        context, source = fetch_context(lookback)
 
-            if context.strip() not in ("(empty)", "(no usable data)"):
-                result = run_claude(context, source)
-                write_mempalace(result)
+        if context.strip() not in ("(empty)", "(no usable data)"):
+            result = run_claude(context, source)
+            write_mempalace(result)
 
-                for p in plugins:
-                    try:
-                        p.process(result, context, source)
-                    except Exception as e:
-                        log.warning(f"plugin {p.name} process error: {e}")
-            else:
-                log.info("no content this cycle — skipping LLM pass")
-
-            _cycle_count += 1
-
-            # Periodic synthesis pass
-            if _cycle_count % SYNTHESIS_EVERY_N == 0:
+            for p in plugins:
                 try:
-                    from mempalace.knowledge_graph import KnowledgeGraph
-                    palace_path = os.path.expanduser(MEMPALACE_PATH)
-                    kg_path     = os.path.join(palace_path, "knowledge_graph.sqlite3")
-                    kg          = KnowledgeGraph(db_path=kg_path)
-                    run_synthesis_pass(kg)
+                    p.process(result, context, source)
                 except Exception as e:
-                    log.warning(f"could not init KG for synthesis: {e}")
+                    log.warning(f"plugin {p.name} process error: {e}")
+        else:
+            log.info("no content this cycle — skipping LLM pass")
 
-            log.info(f"cycle complete — sleeping {POLL_INTERVAL_MIN}m")
+        # Synthesis pass — date-based, every SYNTHESIS_INTERVAL_DAYS days
+        if _synthesis_due():
+            try:
+                from mempalace.knowledge_graph import KnowledgeGraph
+                palace_path = os.path.expanduser(MEMPALACE_PATH)
+                kg_path     = os.path.join(palace_path, "knowledge_graph.sqlite3")
+                kg          = KnowledgeGraph(db_path=kg_path)
+                run_synthesis_pass(kg)
+                meta = _load_metadata()
+                meta["last_synthesis_date"] = str(date.today())
+                _save_metadata(meta)
+            except Exception as e:
+                log.warning(f"could not run synthesis: {e}")
 
-        except Exception as e:
-            log.error(f"unhandled error in cycle: {e} — continuing")
+        # Record that FA ran today so C2 restarts don't double-fire
+        meta = _load_metadata()
+        meta["last_run_date"] = str(date.today())
+        _save_metadata(meta)
 
-        _stop.wait(timeout=POLL_INTERVAL_MIN * 60)
+        log.info("daily cycle complete — exiting")
 
-    for p in plugins:
-        try:
-            p.on_stop()
-        except Exception as e:
-            log.warning(f"plugin {p.name} on_stop error: {e}")
+    except Exception as e:
+        log.error(f"unhandled error in cycle: {e}")
 
-    log.info("filter agent stopped cleanly")
+    finally:
+        for p in plugins:
+            try:
+                p.on_stop()
+            except Exception as e:
+                log.warning(f"plugin {p.name} on_stop error: {e}")
 
 
 if __name__ == "__main__":

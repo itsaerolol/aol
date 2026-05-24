@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Screenpipe AOL (Autonomous Operational Layer) is a personal memory and activity monitoring system. It captures screen/audio data via the external Screenpipe service, then uses an LLM to extract operationally significant memories and store them in a vector database and knowledge graph.
+Screenpipe AOL (Autonomous Operational Layer) is a personal memory and activity monitoring system. It captures screen/audio data via the external Screenpipe service, then uses Claude (Anthropic API) to extract operationally significant memories and store them in a vector database and knowledge graph.
 
 ## Running the System
 
@@ -13,15 +13,13 @@ Screenpipe AOL (Autonomous Operational Layer) is a personal memory and activity 
 python aol_c2.py
 # Dashboard available at http://localhost:45139
 
-# Run filter agent standalone (for testing memory extraction)
+# Run filter agent standalone (one-shot, for testing)
 python filter_agent.py
 ```
 
-The C2 service manages two child processes:
+The C2 service manages one persistent child process and one scheduled daily process:
 - **Screenpipe recorder**: `npx screenpipe@latest record` (screen/audio capture)
-- **Filter Agent**: `python filter_agent.py` (memory extraction, polls every 12 hours)
-
-Filter Agent runs in lockstep with Screenpipe — it starts and stops together with it across all conditions (idle, blackout, manual override).
+- **Filter Agent**: `python filter_agent.py` — runs once per day at 21:30, launched by `control_loop.py`, exits after one cycle
 
 ## Environment Setup
 
@@ -33,59 +31,84 @@ FILTER_AGENT_PYTHON=...       # optional: full path to Python interpreter that h
                               # defaults to sys.executable (same Python running C2)
 ```
 
-Dependencies: `fastapi`, `uvicorn`, `psutil`, `pynput`, `requests`, `python-dotenv`, `chromadb`, `mempalace`, `anthropic`
-
-## Module Structure
-
-```
-aol_c2.py              # Entry point — 12 lines, just runs uvicorn
-server.py              # FastAPI app + lifespan + control/log routes — mounts 3 routers
-├── ws.py              # WSManager, build_status(), push_loop(), /ws WebSocket endpoint
-├── memory_api.py      # APIRouter at /memory — /search, /recent, /kg
-└── html.py            # Dashboard HTML string + / route
-config.py              # All constants: ports, thresholds, paths, model names
-logs.py                # Three circular log buffers (200-item cap) + log functions
-activity.py            # pynput mouse/keyboard listeners, idle_seconds(), in_blackout()
-screenpipe.py          # Screenpipe subprocess lifecycle: start(), stop(), running(), pid()
-filter_controller.py   # Filter Agent subprocess lifecycle (same API shape as screenpipe.py)
-control_loop.py        # Orchestration loop: idle/blackout/override → start/stop both processes
-filter_agent.py        # Memory extraction agent (runs as subprocess, also standalone)
-plugins/
-├── base.py            # AOLPlugin ABC: process(), on_start(), on_stop()
-├── __init__.py        # load_plugins() — auto-discovers .py files in plugins/
-└── daily_digest.py    # Writes nightly HIGH/MEDIUM memory digest to ~/aol-memory/digests/
-legacy versions/       # Historical v1 and v3 — kept for reference, not active
-```
+Dependencies: `fastapi`, `uvicorn`, `psutil`, `pynput`, `requests`, `python-dotenv`, `chromadb`, `mempalace`
 
 ## Architecture
 
-### Entry & Server Layer
-- `aol_c2.py` — runs `uvicorn` on port `45139`, nothing else
-- `server.py` — lifespan starts activity listeners + control loop thread + WebSocket push task; mounts ws/memory_api/html routers; owns control endpoints (`/start`, `/stop`, `/resume`, `/filter/start`, `/filter/stop`, `/status`) and raw log endpoints (`/logs`, `/screenpipe-logs`, `/filter-logs`)
-- `ws.py` — WebSocket at `/ws`; pushes `{status, c2_logs, sp_logs, fa_logs}` to all clients every 1 second; dashboard polls this instead of HTTP
-- `html.py` — self-contained dashboard: status cards, action buttons, 3 live log panels, memory search panel, KG triple viewer
-- `memory_api.py` — `/memory/search` (semantic ChromaDB), `/memory/recent`, `/memory/kg` (KG triple lookup by entity)
+### `aol_c2.py` — Entry Point
+Launches uvicorn on port `45139`. Imports `server.py`.
 
-### Control Layer
-- `control_loop.py` — runs on a daemon thread; checks idle/blackout/override every 30 seconds; stops/starts both Screenpipe and Filter Agent together
-- `activity.py` — tracks last input timestamp via pynput; exposes `idle_seconds()`, `in_blackout()`, `last_activity_time()`
-- `screenpipe.py` / `filter_controller.py` — each owns one subprocess with a thread-safe lock, stderr/stdout drain thread, and `start()` / `stop()` / `running()` / `pid()` interface
+### `server.py` — FastAPI App
+- Lifespan starts activity listeners + control loop thread
+- REST endpoints: `/start`, `/stop`, `/resume`, `/status`, `/logs`
+- `/shutdown` — graceful shutdown (stops children, exits process)
+- `/restart` — graceful shutdown + detached relaunch after 2s port-free delay
+- Serves dashboard at `/`
 
-### Filter Agent (`filter_agent.py`)
-- Polls Screenpipe `/activity-summary` every 12 hours; falls back to raw `/search` OCR+audio
-- Uses Claude (`claude-opus-4-7`) to extract structured memories and knowledge graph facts
-- Writes HIGH/MEDIUM memories to ChromaDB and KG triples to SQLite via mempalace; JSONL fallback if libraries unavailable
-- Every 5 cycles runs a synthesis pass: promotes repeated session facts to permanent KG entries
-- Loads plugins from `plugins/` on startup; calls `plugin.process(result, context, source)` after each cycle
+### `control_loop.py` — Orchestration
+- Runs every 30 seconds (`CHECK_INTERVAL_SECONDS`)
+- Screenpipe: starts on boot (if not blackout), stops on idle >10 min, resumes on activity
+- Filter Agent: **time-based trigger** — fires at 21:30 daily regardless of idle state
+  - `_fa_due()` checks current time vs `FILTER_AGENT_HOUR/MINUTE` from config
+  - `_fa_last_run_date` persisted in `filter_metadata.json` so C2 restarts don't double-fire
+  - Blackout (4–10 AM) kills a mid-run FA; idle state does NOT block the scheduled run
 
-### Plugin System
-Drop a `.py` file in `plugins/`, subclass `AOLPlugin`, implement `process()`. Loaded automatically on filter agent startup. `on_start()` and `on_stop()` called at agent lifecycle boundaries.
+### `filter_agent.py` — Memory Extraction (One-Shot)
+- **Execution model**: runs one cycle, writes output, exits (code 0). No internal loop or sleep.
+- **Schedule**: launched by `control_loop.py` at 21:30. Can also be triggered manually via dashboard FA Start button.
+- **LLM**: Claude (`claude-opus-4-7`) via Anthropic Messages API
+- **Lookback window**: 1500 min (~25 hours) to handle slight timing drift
+- **Data pipeline**: `/activity-summary` endpoint → fallback to raw `/search` OCR+audio
+- **Grounding context** (injected into each LLM call before capture data):
+  1. `MemoryStack.wake_up(wing="aero-ops")` — L0 identity + L1 room snapshots
+  2. Current KG facts for entity `aero` — prevents re-asserting known stable facts
+- **Memory schema**: `priority`, `summary`, `tags[]`, `timestamp` — no domain enum, no project field. Tags are free-form, lowercase, hyphenated (e.g. `aol-system`, `afrotc-deadline`, `new-pattern`).
+- **Writes to**:
+  - **ChromaDB** (vector store at `~/aol-memory`) for semantic search
+  - **KnowledgeGraph** (SQLite at `~/aol-memory/knowledge_graph.sqlite3`) — stable facts only, no per-cycle snapshots
+  - **JSONL fallback** (`~/aol-memory/filter_fallback.jsonl`) if libraries unavailable
+- **Synthesis pass**: every 5 days (`SYNTHESIS_INTERVAL_DAYS`), promotes repeated session/weekly KG facts to permanent. Date tracked in `filter_metadata.json` (`last_synthesis_date`).
+- **Metadata file**: `~/aol-memory/filter_metadata.json` — persists `last_run_date` and `last_synthesis_date` across invocations.
+
+### `activity.py` — Input Tracking
+- `pynput` listeners for mouse clicks and keyboard presses only (mouse movement ignored)
+- `idle_seconds()`, `is_idle()`, `in_blackout()` used by control loop
+
+### `filter_controller.py` — Subprocess Lifecycle
+- `start()` spawns FA as a subprocess, drains stdout to FA log buffer
+- `stop()` terminates with 10s timeout then kill
+- `running()` uses `poll()` — returns False as soon as FA exits naturally
+- No auto-restart after natural exit (exit code 0); restart only comes from next `_fa_due()` trigger
+
+### `memory_api.py` — Memory Query Endpoints
+- `/memory/search?q=...&domain=...` — semantic search over ChromaDB
+- `/memory/recent?domain=...` — most recent entries
+- `/memory/kg?subject=aero` — KG triples for an entity
+- `domain` filter matches both old `domain` metadata field (legacy) and new `tags` array (current schema)
+
+### `dashboard.py` — Web UI
+- WebSocket-pushed status (1s latency), 3-panel log viewer
+- Control buttons: SP Start/Stop, Auto, FA Start/Stop, **Restart**, **Shutdown**
+- Restart/Shutdown require browser confirm dialog
+
+## MemPalace Setup
+
+- Wing: `aero-ops`
+- Rooms: `daily-activity`, `identity`, `working-style`, `projects-active`, `tech-environment`, `workspace-map`, `aol-system`
+- Identity file (L0): `~/.mempalace/identity.txt` (not in the palace directory)
+- Palace path: `~/aol-memory`
 
 ## Key Design Decisions
 
-- **FA follows SP** — Filter Agent starts and stops in lockstep with Screenpipe. No point running FA during idle/blackout since no new data is being recorded.
-- **WebSocket over polling** — dashboard uses a persistent WebSocket connection instead of HTTP polling; 1-second push latency vs. 3-second poll.
-- **FILTER_AGENT_PYTHON env var** — if mempalace is installed under a different Python interpreter than the one running C2, set this in `.env`. Filter agent logs which interpreter it's using and warns on startup if mempalace is not importable.
+- **FA is one-shot** — FA exits after each daily run. No sleeping subprocess. Scheduling is `control_loop.py`'s responsibility.
+- **FA decoupled from SP** — Screenpipe still follows idle/blackout. FA fires at 21:30 regardless of idle state (24h window always has data).
+- **Free-form tags over domain enum** — novel activity gets tagged and stored, not discarded. `new-pattern` tag for unrecognized activity.
+- **KG is stable facts only** — per-cycle domain/project triples removed. Drawers handle episodic memory; KG handles durable entity facts.
+- **Grounding before generation** — each FA cycle injects existing memory context + KG facts into the prompt before processing new data.
+- **WebSocket over polling** — dashboard uses persistent WebSocket; 1s push latency.
+- **FILTER_AGENT_PYTHON env var** — if mempalace is on a different Python interpreter than C2, set this in `.env`.
+- **Two-stage fallback** — FA tries `/activity-summary` first, falls back to raw `/search` OCR+audio.
 - **Single entry point** — always start via `aol_c2.py`. Don't run Screenpipe or filter_agent manually in production.
-- **Two-stage fallback** — filter agent tries `/activity-summary` first (pre-compressed), falls back to raw `/search` OCR+audio if empty.
-- **Memory domains** — Developer, AFROTC, Faith, Creative, Finance. Gaming, streaming, idle, duplicate content are discarded.
+
+## TODO
+[ ] [AUTO] There is no fallback incase the C2 is not running, and it misses a day. It should be able to catch up. propose solutions

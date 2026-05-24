@@ -5,7 +5,11 @@ Lifespan starts all subsystems.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
 import threading
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -16,7 +20,7 @@ import filter_controller
 import screenpipe
 import ws
 import memory_api
-import html as html_
+import dashboard
 from config import C2_PORT, IDLE_THRESHOLD_MINUTES
 from logs import filter_log_buffer, log, log_buffer, sp_log_buffer
 
@@ -49,7 +53,7 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 app.include_router(ws.router)
 app.include_router(memory_api.router)
-app.include_router(html_.router)
+app.include_router(dashboard.router)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +97,37 @@ def api_filter_start():
 @app.post("/filter/stop")
 def api_filter_stop():
     filter_controller.stop("manual stop")
+    return {"ok": True}
+
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+@app.post("/shutdown")
+def api_shutdown():
+    def _do():
+        time.sleep(0.3)   # let the HTTP response escape
+        _cleanup()
+        os._exit(0)
+    threading.Thread(target=_do, daemon=True).start()
+    return {"ok": True}
+
+
+@app.post("/restart")
+def api_restart():
+    def _do():
+        time.sleep(0.3)
+        _cleanup()
+        script = os.path.join(_HERE, "aol_c2.py")
+        # Wait 2 s (for the port to free) then relaunch — fully detached so it
+        # survives after this process exits.
+        subprocess.Popen(
+            f'cmd /c timeout /t 2 /nobreak >nul && "{sys.executable}" "{script}"',
+            shell=True,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        os._exit(0)
+    threading.Thread(target=_do, daemon=True).start()
     return {"ok": True}
 
 
