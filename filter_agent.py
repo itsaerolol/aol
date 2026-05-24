@@ -692,6 +692,14 @@ def check_env():
     if missing:
         log.error(f"missing env vars: {', '.join(missing)}")
         raise SystemExit(1)
+    try:
+        import mempalace
+        log.info(f"mempalace OK ({sys.executable})")
+    except ImportError:
+        log.warning(
+            f"mempalace not found under {sys.executable} — "
+            "set FILTER_AGENT_PYTHON in .env to the interpreter that has it installed"
+        )
 
 
 def check_screenpipe():

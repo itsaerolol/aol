@@ -56,7 +56,9 @@ HTML = """<!DOCTYPE html>
     background: #060606; border: 1px solid #161616; border-radius: 6px;
     padding: 0.9rem; height: 260px; overflow-y: auto;
     font-size: 0.68rem; line-height: 1.65;
+    scrollbar-width: none;
   }
+  .log-box::-webkit-scrollbar { display: none; }
   .e-c2  { color: #555; } .e-c2.r  { color: #888; }
   .e-sp  { color: #3a4a3a; } .e-sp.r { color: #4a6a5a; }
   .e-fa  { color: #2a3a4a; } .e-fa.r { color: #4a6080; }
@@ -84,7 +86,9 @@ HTML = """<!DOCTYPE html>
     background: #060606; border: 1px solid #161616; border-radius: 6px;
     padding: 0.9rem; min-height: 120px; max-height: 340px; overflow-y: auto;
     font-size: 0.7rem; line-height: 1.7;
+    scrollbar-width: none;
   }
+  .mem-results::-webkit-scrollbar { display: none; }
   .mem-card { border-bottom: 1px solid #111; padding: 0.6rem 0; }
   .mem-card:last-child { border-bottom: none; }
   .mem-meta { font-size: 0.62rem; color: #444; margin-bottom: 0.2rem; }
