@@ -56,18 +56,26 @@ Launches uvicorn on port `45139`. Imports `server.py`.
 ### `filter_agent.py` — Memory Extraction (One-Shot)
 - **Execution model**: runs one cycle, writes output, exits (code 0). No internal loop or sleep.
 - **Schedule**: launched by `control_loop.py` at 21:30. Can also be triggered manually via dashboard FA Start button.
-- **LLM**: Claude (`claude-opus-4-7`) via Anthropic Messages API
+- **LLM**: Claude (`claude-sonnet-4-6`) via Anthropic Messages API
 - **Lookback window**: 1500 min (~25 hours) to handle slight timing drift
 - **Data pipeline**: `/activity-summary` endpoint → fallback to raw `/search` OCR+audio
 - **Grounding context** (injected into each LLM call before capture data):
   1. `MemoryStack.wake_up(wing="aero-ops")` — L0 identity + L1 room snapshots
   2. Current KG facts for entity `aero` — prevents re-asserting known stable facts
+  3. All existing tags from ChromaDB metadata — prevents tag duplication (same pattern as KG dedup)
+- **Anti-hallucination policy** (small/local model compatibility):
+  - Output bounded: max 2 memories per cycle; 3rd only if one is HIGH priority
+  - Rejection policy in all 3 prompts: "if uncertain, omit — an empty result is valid"
+  - Format lock in all 3 prompts: output ONLY the JSON structure, no prose or fences
+  - Pre-write validation drops any memory/KG fact that fails schema (wrong priority value, non-list tags, malformed tag format `^[a-z][a-z0-9-]*$`, empty evidence, non-snake_case predicate, invalid durability)
+  - All drops logged with field name + value for debugging model output
 - **Memory schema**: `priority`, `summary`, `tags[]`, `timestamp` — no domain enum, no project field. Tags are free-form, lowercase, hyphenated (e.g. `aol-system`, `afrotc-deadline`, `new-pattern`).
 - **Writes to**:
   - **ChromaDB** (vector store at `~/aol-memory`) for semantic search
   - **KnowledgeGraph** (SQLite at `~/aol-memory/knowledge_graph.sqlite3`) — stable facts only, no per-cycle snapshots
   - **JSONL fallback** (`~/aol-memory/filter_fallback.jsonl`) if libraries unavailable
 - **Synthesis pass**: every 5 days (`SYNTHESIS_INTERVAL_DAYS`), promotes repeated session/weekly KG facts to permanent. Date tracked in `filter_metadata.json` (`last_synthesis_date`).
+- **Learn pass**: every 7 days (`LEARN_INTERVAL_DAYS`), rewrites the 4 stable MemPalace rooms (`working-style`, `projects-active`, `tech-environment`, `workspace-map`) by feeding Claude the last 14 days of drawers + all KG facts. Output replaces existing room ChromaDB entries via delete+upsert with deterministic IDs (`room:aero-ops:<room-name>`). Date tracked in `filter_metadata.json` (`last_learn_date`).
 - **Metadata file**: `~/aol-memory/filter_metadata.json` — persists `last_run_date` and `last_synthesis_date` across invocations.
 
 ### `activity.py` — Input Tracking
@@ -87,8 +95,12 @@ Launches uvicorn on port `45139`. Imports `server.py`.
 - `domain` filter matches both old `domain` metadata field (legacy) and new `tags` array (current schema)
 
 ### `dashboard.py` — Web UI
-- WebSocket-pushed status (1s latency), 3-panel log viewer
-- Control buttons: SP Start/Stop, Auto, FA Start/Stop, **Restart**, **Shutdown**
+- WebSocket-pushed status (1s latency), 3-panel sectioned layout
+- **Screenpipe panel**: Start / Stop / Auto buttons + SP output terminal
+- **Filter Agent panel**: Run Now only (no Stop — FA is one-shot). Shows next scheduled run time + FA output terminal
+- **C2 panel**: Idle / Blackout / Override status + Restart / Shutdown buttons + C2 log terminal
+- **Memory panel**: semantic search + tag filter (free-form, not domain enum) + KG lookup. Results show tags as pills, not legacy domain/project fields
+- Log terminals newest-at-top; view pins to top unless user has scrolled down
 - Restart/Shutdown require browser confirm dialog
 
 ## MemPalace Setup
@@ -102,6 +114,7 @@ Launches uvicorn on port `45139`. Imports `server.py`.
 
 - **FA is one-shot** — FA exits after each daily run. No sleeping subprocess. Scheduling is `control_loop.py`'s responsibility.
 - **FA decoupled from SP** — Screenpipe still follows idle/blackout. FA fires at 21:30 regardless of idle state (24h window always has data).
+- **No FA Stop button** — FA is one-shot; it exits naturally. Dashboard exposes only "Run Now" for manual trigger.
 - **Free-form tags over domain enum** — novel activity gets tagged and stored, not discarded. `new-pattern` tag for unrecognized activity.
 - **KG is stable facts only** — per-cycle domain/project triples removed. Drawers handle episodic memory; KG handles durable entity facts.
 - **Grounding before generation** — each FA cycle injects existing memory context + KG facts into the prompt before processing new data.

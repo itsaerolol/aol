@@ -11,7 +11,7 @@ FILTER_AGENT_MINUTE = 30
 C2_PORT                = 45139
 LOG_CAP                = 200
 
-SCREENPIPE_CMD = ["npx", "screenpipe@latest", "record"]
+SCREENPIPE_CMD = ["npx", "screenpipe@latest", "record", "--audio-chunk-duration", "300", "--filter-music"]
 SCREENPIPE_API = "http://localhost:3030"
 
 SCRIPT_DIR          = os.path.dirname(os.path.abspath(__file__))

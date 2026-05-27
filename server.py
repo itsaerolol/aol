@@ -1,7 +1,5 @@
 """
 AOL C2 — FastAPI app.
-Mounts routers from ws, memory_api, html.
-Lifespan starts all subsystems.
 """
 
 import asyncio
@@ -17,7 +15,7 @@ from fastapi import FastAPI
 import activity
 import control_loop
 import filter_controller
-import screenpipe
+import vision as screenpipe
 import ws
 import memory_api
 import dashboard
@@ -26,8 +24,11 @@ from logs import filter_log_buffer, log, log_buffer, sp_log_buffer
 
 
 def _cleanup():
+    log("cleanup: stopping screenpipe")
     screenpipe.stop("C2 shutdown")
+    log("cleanup: stopping filter agent")
     filter_controller.stop("C2 shutdown")
+    log("cleanup: stopping input listeners")
     activity.stop()
     try:
         import ctypes
@@ -40,13 +41,16 @@ def _cleanup():
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    log("C2 lifespan starting")
     activity.start(log_fn=log)
+    log("spawning control loop thread")
     threading.Thread(target=control_loop.run, daemon=True).start()
     asyncio.create_task(ws.push_loop())
     log(f"C2 dashboard live at http://localhost:{C2_PORT}")
     try:
         yield
     finally:
+        log("C2 lifespan ending — running cleanup")
         _cleanup()
 
 
@@ -67,35 +71,46 @@ def status():
 
 @app.post("/start")
 def api_start():
+    log("API /start — clearing override, starting screenpipe")
     control_loop.set_override(False)
     screenpipe.start()
-    # FA is one-shot daily — don't start it here. Use /filter/start for manual FA.
     return {"ok": True}
 
 
 @app.post("/stop")
 def api_stop():
+    log("API /stop — setting override, stopping screenpipe + FA")
     control_loop.set_override(True)
     screenpipe.stop("manual stop")
     filter_controller.stop("manual stop")
     return {"ok": True}
 
 
+@app.post("/screenpipe/stop")
+def api_screenpipe_stop():
+    """Stop screenpipe only — no override change. Used by FA when it self-started SP."""
+    log("API /screenpipe/stop — stopping screenpipe (no override change)")
+    screenpipe.stop("fa-cleanup")
+    return {"ok": True}
+
+
 @app.post("/resume")
 def api_resume():
+    log("API /resume — clearing override")
     control_loop.set_override(False)
-    log("override cleared — resuming auto-control")
     return {"ok": True}
 
 
 @app.post("/filter/start")
 def api_filter_start():
+    log("API /filter/start — launching filter agent manually")
     filter_controller.start()
     return {"ok": True}
 
 
 @app.post("/filter/stop")
 def api_filter_stop():
+    log("API /filter/stop — stopping filter agent")
     filter_controller.stop("manual stop")
     return {"ok": True}
 
@@ -105,8 +120,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 
 @app.post("/shutdown")
 def api_shutdown():
+    log("API /shutdown — scheduling shutdown in 0.3s")
     def _do():
-        time.sleep(0.3)   # let the HTTP response escape
+        time.sleep(0.3)
         _cleanup()
         os._exit(0)
     threading.Thread(target=_do, daemon=True).start()
@@ -115,12 +131,12 @@ def api_shutdown():
 
 @app.post("/restart")
 def api_restart():
+    log("API /restart — scheduling restart in 0.3s")
     def _do():
         time.sleep(0.3)
         _cleanup()
         script = os.path.join(_HERE, "aol_c2.py")
-        # Wait 2 s (for the port to free) then relaunch — fully detached so it
-        # survives after this process exits.
+        log(f"relaunching: {sys.executable} {script}")
         subprocess.Popen(
             f'cmd /c timeout /t 2 /nobreak >nul && "{sys.executable}" "{script}"',
             shell=True,
@@ -132,7 +148,7 @@ def api_restart():
 
 
 # ---------------------------------------------------------------------------
-# Log routes (kept for curl / external tooling)
+# Log routes
 # ---------------------------------------------------------------------------
 
 @app.get("/logs")

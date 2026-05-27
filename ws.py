@@ -4,7 +4,7 @@ import asyncio
 import activity
 import control_loop
 import filter_controller
-import screenpipe
+import vision as screenpipe
 from config import BLACKOUT_START_HOUR, BLACKOUT_END_HOUR, IDLE_THRESHOLD_MINUTES
 from logs import filter_log_buffer, log_buffer, sp_log_buffer
 
@@ -52,6 +52,7 @@ def build_status() -> dict:
         "blackout_window": f"{BLACKOUT_START_HOUR:02d}:00–{BLACKOUT_END_HOUR:02d}:00",
         "sp_pid":          screenpipe.pid(),
         "fa_pid":          filter_controller.pid(),
+        "fa_next_run":     control_loop.fa_next_run_display(),
     }
 
 

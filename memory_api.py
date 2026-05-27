@@ -30,15 +30,16 @@ def _collection():
 
 
 @router.get("/search")
-def search(q: str, limit: int = 10, domain: str | None = None):
+def search(q: str, limit: int = 10, domain: str | None = None, min_score: float = 0.35):
     """Semantic search over ChromaDB memories.
-    domain filter matches both old 'domain' metadata field and new 'tags' array."""
+    domain filter matches both old 'domain' metadata field and new 'tags' array.
+    min_score filters out low-relevance results (0–1, default 0.35)."""
     if not q.strip():
         return JSONResponse({"error": "q is required"}, status_code=400)
     try:
         col     = _collection()
         # Fetch more than requested so post-filtering doesn't under-deliver
-        fetch_n = min(limit * 4 if domain else limit, 100)
+        fetch_n = min(limit * 4 if domain else limit * 2, 100)
         results = col.query(query_texts=[q], n_results=fetch_n)
         docs    = results.get("documents", [[]])[0]
         metas   = results.get("metadatas", [[]])[0]
@@ -47,6 +48,8 @@ def search(q: str, limit: int = 10, domain: str | None = None):
             {"summary": d, "score": round(1 - dist, 3), **m}
             for d, m, dist in zip(docs, metas, dists)
         ]
+        # Drop irrelevant results below the relevance threshold
+        items = [it for it in items if it["score"] >= min_score]
         if domain:
             items = [it for it in items if _tag_match(it, domain)]
         return {"results": items[:limit], "count": len(items[:limit])}
@@ -82,14 +85,7 @@ def kg(subject: str = "aero", limit: int = 100):
     try:
         from mempalace.knowledge_graph import KnowledgeGraph
         store   = KnowledgeGraph(db_path=MEMPALACE_KG_PATH)
-        triples = []
-        for method in ("get_triples", "query_triples", "search_triples"):
-            if hasattr(store, method):
-                try:
-                    triples = getattr(store, method)(subject=subject) or []
-                    break
-                except Exception:
-                    pass
+        triples = store.query_entity(name=subject) or []
         return {"subject": subject, "triples": triples[:limit], "count": len(triples)}
     except ImportError:
         return JSONResponse({"error": "mempalace not installed"}, status_code=503)
